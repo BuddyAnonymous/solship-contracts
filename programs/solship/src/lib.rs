@@ -1,6 +1,6 @@
 use anchor_lang::{prelude::*, solana_program};
 use solana_program::{
-    blake3::{hash, hashv, Hash, Hasher},
+    blake3::{hash, Hash},
     log::sol_log_compute_units,
 };
 
@@ -124,7 +124,7 @@ pub mod solship {
         // let proving_field_index = leaf.index;
 
         // Double hash the leaf to prevent second preimage attack "https://www.rareskills.io/post/merkle-tree-second-preimage-attack"
-        let hashed_leaf = double_hash_leaf(&leaf);
+        let hashed_leaf = hash_leaf(&leaf);
 
         let root = get_player_board_hash(*ctx.accounts.player.key, &mut ctx.accounts.game)?;
 
@@ -168,6 +168,9 @@ pub mod solship {
     pub fn claim_win(ctx: Context<ClaimWin>, table: [ProofField; 128]) -> Result<()> {
         let player = *ctx.accounts.player.key;
         let game: &mut Account<'_, Game> = &mut ctx.accounts.game;
+
+        verify_table(table, player, &game)?;
+        return Ok(());
 
         check_if_player_is_part_of_game(player, game)?;
 
@@ -277,12 +280,14 @@ fn verify_table(table: [ProofField; 128], player: Pubkey, game: &Game) -> Result
         .iter()
         .enumerate()
         .map(|(index, field)| {
-            Ok(double_hash_leaf(&GameField {
+            Ok(hash_leaf(&GameField {
                 index: index as u8,
                 ship_placed: field.ship_placed,
             }))
         })
         .collect();
+
+
 
     if ships_placed_counter != 17 {
         return err!(CustomError::InvalidTable);
@@ -290,17 +295,24 @@ fn verify_table(table: [ProofField; 128], player: Pubkey, game: &Game) -> Result
 
     let mut leaves = leaves?;
 
+    msg!("Leaves[0]: {:?}", to_hex_string(&leaves[0].to_bytes()));
+    msg!("Leaves[127]: {:?}", to_hex_string(&leaves[127].to_bytes()));
+
     while leaves.len() > 1 {
         let mut next_level = Vec::new();
         for i in (0..leaves.len()).step_by(2) {
             if i + 1 < leaves.len() {
-                next_level.push(hashv(&[&leaves[i].to_bytes(), &leaves[i + 1].to_bytes()]));
+                next_level.push(hash(&[leaves[i].to_bytes(), leaves[i + 1].to_bytes()].concat()));
             } else {
                 next_level.push(leaves[i].clone());
             }
         }
         leaves = next_level;
+        msg!("TEST {}", to_hex_string(&leaves[0].to_bytes()));
     }
+
+    msg!("Root hash: {:?}", to_hex_string(&root));
+    msg!("Calculated root hash: {:?}", to_hex_string(&leaves[0].to_bytes()));
 
     if root == leaves[0].to_bytes() {
         Ok(())
@@ -310,10 +322,7 @@ fn verify_table(table: [ProofField; 128], player: Pubkey, game: &Game) -> Result
 }
 
 #[inline(never)]
-fn double_hash_leaf(leaf: &GameField) -> Hash {
-    msg!("Leaf serialized: {:?}", leaf.serialize());
-    msg!("Leaf hash: {:?}", hash(&leaf.serialize()));
-
+fn hash_leaf(leaf: &GameField) -> Hash {
     hash(&leaf.serialize())
 }
 
@@ -401,16 +410,13 @@ fn verify_merkle_proof(
     }
 
     for (i, dir) in dir_array.iter().enumerate() {
-        let mut hasher = Hasher::default();
         if *dir == 0 {
             // let mut hasher = Hasher::default();
-            hasher.hash(&[proof[i], last_hash.to_bytes()].concat());
-            last_hash = hasher.result();
+            last_hash = hash(&[proof[i], last_hash.to_bytes()].concat());
             // msg!("Last hash hex: {:?}", to_hex_string(&last_hash.to_bytes()));
         } else {
             // let mut hasher = Hasher::default();
-            hasher.hash(&[last_hash.to_bytes(), proof[i]].concat());
-            last_hash = hasher.result();
+            last_hash = hash(&[last_hash.to_bytes(), proof[i]].concat());
             // msg!("Last hash hex: {:?}", to_hex_string(&last_hash.to_bytes()));
         }
     }
@@ -521,7 +527,7 @@ pub struct InitializeQueue<'info> {
 
 #[derive(Accounts)]
 pub struct JoinQueue<'info> {
-    #[account(mut)]
+    #[account(mut, seeds = [b"queue"], bump)]
     pub queue: Account<'info, Queue>,
     #[account(mut)]
     pub player: Signer<'info>,
