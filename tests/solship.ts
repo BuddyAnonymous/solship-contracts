@@ -32,11 +32,11 @@ describe("solship", () => {
 
 		const player1Board = getFixedBoard1();
 		printBoard(player1Board);
-		const player1MerkleRoot = await constructMerkleTree(player1Board);
+		const [player1MerkleRoot, secrets1] = await constructMerkleTree(player1Board);
 		console.log("Player 1 Merkle root:", player1MerkleRoot.hash);
 		const player2Board = getFixedBoard2();
 		printBoard(player2Board);
-		const player2MerkleRoot = await constructMerkleTree(player2Board);
+		const [player2MerkleRoot, secrets2] = await constructMerkleTree(player2Board);
 		console.log("Player 2 Merkle root:", player2MerkleRoot.hash);
 
 		const tx1 = await program.methods.joinQueue(hexStringToByteArray(player1MerkleRoot.hash))
@@ -56,9 +56,27 @@ describe("solship", () => {
 		console.log("GAME: ", await program.account.game.all());
 
 		const gameAddr = (await program.account.game.all())[0].publicKey;
+
 		// Create an array with 28 padding leaves
-		const paddingLeaves = Array(28).fill({ shipPlaced: false });
-		const player1ClaimWinBoard = player1Board.flat().map(cell => ({ shipPlaced: cell })).concat(paddingLeaves);
+		const paddingLeaves = Array(28).fill(null).map((_, index) => {
+			const ind = index + 100;
+			const row = Math.floor(ind / 10);
+			const col = ind % 10;
+
+			// console.log(`Index: ${ind}, Row: ${row}, Col: ${col}`);
+
+			return {
+			  shipPlaced: false,
+			//   secret: new anchor.BN(0),
+			};
+		  });
+
+		const player1ClaimWinBoard = player1Board.flat().map((cell, index) => {
+			const row = Math.floor(index / 10);
+			const col = index % 10;
+			return ({ shipPlaced: cell });
+		}).concat(paddingLeaves);
+
 		try {
 			const tx3 = await program.methods.claimWin(player1ClaimWinBoard)
 				.accountsStrict({

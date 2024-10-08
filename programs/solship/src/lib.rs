@@ -1,14 +1,11 @@
 use anchor_lang::{prelude::*, solana_program};
-use solana_program::{
-    blake3::{hash, Hash},
-    log::sol_log_compute_units,
-};
+use solana_program::blake3::{hash, Hash};
 
 declare_id!("8ud2dBF8N4f9eZwiWnYZ3TEXEaEvm4QHr6Tu6tYKkJ5T");
 
 type BoardHash = [u8; 32];
 
-const TURN_DURATION: u8 = 255; // 75 slots = 75 * 0.4s = 30s
+const TURN_DURATION: u8 = 75; // 75 slots = 75 * 0.4s = 30s
 
 #[program]
 pub mod solship {
@@ -26,6 +23,7 @@ pub mod solship {
 
         let game_player = GamePlayer {
             address: player,
+            session_key: *ctx.accounts.session_key.key,
             board_root,
         };
 
@@ -39,17 +37,19 @@ pub mod solship {
         board_root: BoardHash,
     ) -> Result<()> {
         let player1_board_root = board_root;
-        let enemy_game_player = ctx
+        let pos = ctx
             .accounts
             .queue
             .players
             .iter()
-            .find(|p| p.address == enemy);
+            .position(|p| p.address == enemy);
 
-        if enemy_game_player.is_none() {
+        if pos.is_none() {
             return err!(CustomError::PlayerNotPartOfGame);
         }
-        let enemy_board_root = enemy_game_player.unwrap().board_root;
+
+        let enemy_game_player = ctx.accounts.queue.players.remove(pos.unwrap());
+        let enemy_board_root = enemy_game_player.board_root;
 
         let game = &mut ctx.accounts.game;
         game.player1 = *ctx.accounts.player.key;
@@ -57,6 +57,8 @@ pub mod solship {
         game.player1_board_hash = player1_board_root;
         game.player2_board_hash = enemy_board_root;
         game.current_turn = 1;
+        game.player1_session_key = *ctx.accounts.session_key.key;
+        game.player2_session_key = enemy_game_player.session_key;
         // game.player1_attacked_fields = [false; 100];
         // game.player2_attacked_fields = [false; 100];
         game.player1_attacked_this_turn = false;
@@ -84,7 +86,7 @@ pub mod solship {
 
         let player = *ctx.accounts.player.key;
         check_time_expired(game)?;
-        check_if_player_is_part_of_game(player, game)?;
+        let player = check_if_player_is_part_of_game(player, game)?;
 
         if player != game.player1 && player != game.player2 {
             return Err(CustomError::PlayerNotPartOfGame.into());
@@ -126,7 +128,8 @@ pub mod solship {
         // Double hash the leaf to prevent second preimage attack "https://www.rareskills.io/post/merkle-tree-second-preimage-attack"
         let hashed_leaf = hash_leaf(&leaf);
 
-        let root = get_player_board_hash(*ctx.accounts.player.key, &mut ctx.accounts.game)?;
+        let (root, player) =
+            get_player_board_hash(*ctx.accounts.player.key, &mut ctx.accounts.game)?;
 
         let is_proof_valid = verify_merkle_proof(
             hashed_leaf,
@@ -134,17 +137,17 @@ pub mod solship {
             root,
             leaf.index,
             &mut ctx.accounts.game,
-            *ctx.accounts.player.key,
+            player,
         )?;
 
         if !is_proof_valid {
-            ctx.accounts.game.winner = *ctx.accounts.player.key;
+            // ctx.accounts.game.winner = *ctx.accounts.player.key;
             return err!(CustomError::InvalidProof);
         }
 
-        if *ctx.accounts.player.key == ctx.accounts.game.player1 {
+        if player == ctx.accounts.game.player1 {
             ctx.accounts.game.player1_verified_proof_this_turn = true;
-        } else if *ctx.accounts.player.key == ctx.accounts.game.player2 {
+        } else if player == ctx.accounts.game.player2 {
             ctx.accounts.game.player2_verified_proof_this_turn = true;
         } else {
             return err!(CustomError::PlayerNotPartOfGame);
@@ -152,15 +155,12 @@ pub mod solship {
 
         emit!(ProofVerified {
             game: ctx.accounts.game.key(),
-            player: *ctx.accounts.player.key,
-            attacked_field: leaf.index
+            player: player,
+            attacked_field: leaf.index,
+            ship_placed: leaf.ship_placed
         });
 
-        update_game_state(
-            &mut ctx.accounts.game,
-            leaf.index,
-            *ctx.accounts.player.key,
-        );
+        update_game_state(&mut ctx.accounts.game, leaf.index, player);
 
         Ok(())
     }
@@ -169,35 +169,54 @@ pub mod solship {
         let player = *ctx.accounts.player.key;
         let game: &mut Account<'_, Game> = &mut ctx.accounts.game;
 
-        verify_table(table, player, &game)?;
-        return Ok(());
-
-        check_if_player_is_part_of_game(player, game)?;
+        let player = check_if_player_is_part_of_game(player, game)?;
 
         let current_slot = Clock::get()?.slot;
         let turn_duration = TURN_DURATION as u64;
 
-        if current_slot < game.turn_start_slot + turn_duration {
-            return err!(CustomError::TurnNotExpired);
+        // Ignore turn expiration if the enemy has no remaining ship fields
+        msg!("Player1 remaining ship fields: {}", game.player1_remaining_ship_fields);
+        msg!("Player2 remaining ship fields: {}", game.player2_remaining_ship_fields);
+        msg!("Player1: {:?}", game.player1);
+        msg!("Player2: {:?}", game.player2);
+        msg!("Player: {:?}", player);
+        if !((player == game.player1 && game.player2_remaining_ship_fields == 0)
+            || (player == game.player2 && game.player1_remaining_ship_fields == 0))
+        {
+            if current_slot < game.turn_start_slot + turn_duration {
+                return err!(CustomError::TurnNotExpired);
+            }
         }
 
-        if game.winner == Pubkey::default() {
-            return err!(CustomError::GameFinished);
-        }
+        // if game.winner == Pubkey::default() {
+        //     return err!(CustomError::GameFinished);
+        // }
 
         if player == game.player1
-            && game.player1_attacked_this_turn
-            && (!game.player2_attacked_this_turn || !game.player2_verified_proof_this_turn)
+            && ((!game.player2_attacked_this_turn || !game.player2_verified_proof_this_turn)
+                || game.player2_remaining_ship_fields == 0)
+            && game.player1_remaining_ship_fields > 0
         {
-            game.winner = game.player1;
             verify_table(table, player, &game)?;
+            game.winner = game.player1;
+            emit!(GameFinished {
+                game: game.key(),
+                winner: game.player1
+            });
+
             return Ok(());
         } else if player == game.player2
-            && game.player2_attacked_this_turn
-            && (!game.player1_attacked_this_turn || !game.player1_verified_proof_this_turn)
+            && ((!game.player1_attacked_this_turn || !game.player1_verified_proof_this_turn)
+                || game.player1_remaining_ship_fields == 0)
+            && game.player2_remaining_ship_fields > 0
         {
-            game.winner = game.player2;
             verify_table(table, player, &game)?;
+            game.winner = game.player2;
+            emit!(GameFinished {
+                game: game.key(),
+                winner: game.player2
+            });
+
             return Ok(());
         } else {
             return err!(CustomError::EnemyPlayedTurn);
@@ -216,7 +235,7 @@ fn check_time_expired(game: &Game) -> Result<()> {
 }
 
 fn verify_table(table: [ProofField; 128], player: Pubkey, game: &Game) -> Result<()> {
-    let root = get_player_board_hash(player, game)?;
+    let (root, _) = get_player_board_hash(player, game)?;
 
     let mut ships_placed_counter = 0;
     let mut ship_lengths = vec![0; 4]; // Counters for ships of length 2, 3, 4, 5
@@ -287,8 +306,6 @@ fn verify_table(table: [ProofField; 128], player: Pubkey, game: &Game) -> Result
         })
         .collect();
 
-
-
     if ships_placed_counter != 17 {
         return err!(CustomError::InvalidTable);
     }
@@ -302,17 +319,21 @@ fn verify_table(table: [ProofField; 128], player: Pubkey, game: &Game) -> Result
         let mut next_level = Vec::new();
         for i in (0..leaves.len()).step_by(2) {
             if i + 1 < leaves.len() {
-                next_level.push(hash(&[leaves[i].to_bytes(), leaves[i + 1].to_bytes()].concat()));
+                next_level.push(hash(
+                    &[leaves[i].to_bytes(), leaves[i + 1].to_bytes()].concat(),
+                ));
             } else {
                 next_level.push(leaves[i].clone());
             }
         }
         leaves = next_level;
-        msg!("TEST {}", to_hex_string(&leaves[0].to_bytes()));
     }
 
     msg!("Root hash: {:?}", to_hex_string(&root));
-    msg!("Calculated root hash: {:?}", to_hex_string(&leaves[0].to_bytes()));
+    msg!(
+        "Calculated root hash: {:?}",
+        to_hex_string(&leaves[0].to_bytes())
+    );
 
     if root == leaves[0].to_bytes() {
         Ok(())
@@ -327,14 +348,16 @@ fn hash_leaf(leaf: &GameField) -> Hash {
 }
 
 #[inline(never)]
-fn get_player_board_hash(player: Pubkey, game: &Game) -> Result<BoardHash> {
-    if player == game.player1 {
-        Ok(game.player1_board_hash)
-    } else if player == game.player2 {
-        Ok(game.player2_board_hash)
-    } else {
-        return err!(CustomError::PlayerNotPartOfGame);
+fn get_player_board_hash(player: Pubkey, game: &Game) -> Result<(BoardHash, Pubkey)> {
+    if player == game.player1 || player == game.player1_session_key {
+        return Ok((game.player1_board_hash, game.player1));
     }
+
+    if player == game.player2 || player == game.player2_session_key {
+        return Ok((game.player2_board_hash, game.player2));
+    }
+
+    return err!(CustomError::PlayerNotPartOfGame);
 }
 
 fn check_tried_verifying(tried_verifying: &mut bool) -> Result<()> {
@@ -441,11 +464,19 @@ fn verify_merkle_proof(
     Ok(last_hash == Hash::new_from_array(root))
 }
 
-fn check_if_player_is_part_of_game(player: Pubkey, game: &Game) -> Result<()> {
-    if player != game.player1 && player != game.player2 {
-        return err!(CustomError::PlayerNotPartOfGame);
+fn check_if_player_is_part_of_game(player: Pubkey, game: &Game) -> Result<Pubkey> {
+    if player == game.player1 || player == game.player1_session_key {
+        return Ok(game.player1);
     }
-    Ok(())
+
+    if player == game.player2 || player == game.player2_session_key {
+        return Ok(game.player2);
+    }
+
+    msg!("Player: {:?}", player);
+    msg!("Game: {:?}", game);
+
+    return err!(CustomError::PlayerNotPartOfGame);
 }
 
 fn update_game_state(game: &mut Account<'_, Game>, proving_field_index: u8, player: Pubkey) {
@@ -472,31 +503,32 @@ fn update_game_state(game: &mut Account<'_, Game>, proving_field_index: u8, play
             turn: game.current_turn - 1
         });
 
-        if game.player1_remaining_ship_fields == 0 && game.player2_remaining_ship_fields == 0 {
-            game.winner = Pubkey::default();
-            emit!(GameFinished {
-                game: game.key(),
-                winner: Pubkey::default()
-            });
-        } else if game.player1_remaining_ship_fields == 0 {
-            game.winner = game.player2;
-            emit!(GameFinished {
-                game: game.key(),
-                winner: game.player2
-            });
-        } else if game.player2_remaining_ship_fields == 0 {
-            game.winner = game.player1;
-            emit!(GameFinished {
-                game: game.key(),
-                winner: game.player1
-            });
-        }
+        // if game.player1_remaining_ship_fields == 0 && game.player2_remaining_ship_fields == 0 {
+        //     game.winner = Pubkey::default();
+        //     emit!(GameFinished {
+        //         game: game.key(),
+        //         winner: Pubkey::default()
+        //     });
+        // } else if game.player1_remaining_ship_fields == 0 {
+        //     game.winner = game.player2;
+        //     emit!(GameFinished {
+        //         game: game.key(),
+        //         winner: game.player2
+        //     });
+        // } else if game.player2_remaining_ship_fields == 0 {
+        //     game.winner = game.player1;
+        //     emit!(GameFinished {
+        //         game: game.key(),
+        //         winner: game.player1
+        //     });
+        // }
     }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
 pub struct ProofField {
     ship_placed: bool,
+    // secret: u64,
     // salt: u64,
 }
 
@@ -504,6 +536,7 @@ pub struct ProofField {
 pub struct GameField {
     index: u8,
     ship_placed: bool,
+    // secret: u64,
 }
 
 impl GameField {
@@ -511,6 +544,7 @@ impl GameField {
         let mut buf = Vec::new();
         buf.push(self.index);
         buf.push(self.ship_placed as u8);
+        // buf.extend_from_slice(&self.secret.to_le_bytes());
         buf
     }
 }
@@ -531,16 +565,18 @@ pub struct JoinQueue<'info> {
     pub queue: Account<'info, Queue>,
     #[account(mut)]
     pub player: Signer<'info>,
+    pub session_key: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 #[instruction(enemy: Pubkey)]
 pub struct CreateGame<'info> {
-    #[account(init, seeds = [b"game", player.key().as_ref() , enemy.as_ref()], bump, payer = player, space = 8 + 2 * 32 + 2 * 32 + 1  + 2 + 2 + 2 + 2 + 2 + 8 + 32)]
+    #[account(init, seeds = [b"game", player.key().as_ref() , enemy.as_ref()], bump, payer = player, space = 8 + 2 * 32 + 2 * 32 + 2 * 32 + 1  + 2 + 2 + 2 + 2 + 2 + 8 + 32)]
     pub game: Account<'info, Game>,
     #[account(mut)]
     pub player: Signer<'info>,
+    pub session_key: Signer<'info>,
     #[account(mut, seeds = [b"queue"], bump)]
     pub queue: Account<'info, Queue>,
     pub system_program: Program<'info, System>,
@@ -566,6 +602,8 @@ pub struct ClaimWin<'info> {
 pub struct Game {
     pub player1: Pubkey,
     pub player2: Pubkey,
+    pub player1_session_key: Pubkey,
+    pub player2_session_key: Pubkey,
     pub player1_board_hash: BoardHash,
     pub player2_board_hash: BoardHash,
     pub current_turn: u8,
@@ -588,6 +626,7 @@ pub struct Game {
 #[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
 pub struct GamePlayer {
     address: Pubkey,
+    session_key: Pubkey,
     board_root: BoardHash,
 }
 
@@ -621,6 +660,7 @@ pub struct ProofVerified {
     game: Pubkey,
     player: Pubkey,
     attacked_field: u8,
+    ship_placed: bool,
 }
 
 #[event]
