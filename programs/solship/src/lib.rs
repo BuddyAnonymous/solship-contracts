@@ -160,7 +160,10 @@ pub mod solship {
             ship_placed: leaf.ship_placed
         });
 
-        update_game_state(&mut ctx.accounts.game, leaf.index, player);
+        msg!("{:?} is proving", player);
+        msg!("Game: {:?}", ctx.accounts.game);
+
+        update_game_state(&mut ctx.accounts.game, leaf.ship_placed, player);
 
         Ok(())
     }
@@ -479,10 +482,19 @@ fn check_if_player_is_part_of_game(player: Pubkey, game: &Game) -> Result<Pubkey
     return err!(CustomError::PlayerNotPartOfGame);
 }
 
-fn update_game_state(game: &mut Account<'_, Game>, proving_field_index: u8, player: Pubkey) {
-    if player == game.player1 && game.field_player2_attacked_this_turn == proving_field_index {
+fn update_game_state(game: &mut Account<'_, Game>, ship_hit: bool, player: Pubkey) {
+    msg!("Player: {}", player);
+    msg!("Player {:?}", player);
+    msg!("Player1: {:?}", game.player1);
+    // msg!("game.field_player2_attacked_this_turn: {}", proving_field_index);
+    // msg!("Proving field: {}", proving_field_index);
+
+    msg!("Player1 {}", game.player1);
+    msg!("game.field_player1_attacked_this_turn: {}", game.field_player1_attacked_this_turn);
+
+    if player == game.player1 && ship_hit {
         game.player1_remaining_ship_fields -= 1;
-    } else if player == game.player2 && game.field_player1_attacked_this_turn == proving_field_index
+    } else if player == game.player2 && ship_hit
     {
         game.player2_remaining_ship_fields -= 1;
     }
@@ -497,6 +509,10 @@ fn update_game_state(game: &mut Account<'_, Game>, proving_field_index: u8, play
         game.player2_attacked_this_turn = false;
         game.player1_tried_verifing_this_turn = false;
         game.player2_tried_verifing_this_turn = false;
+        game.field_player1_attacked_this_turn = 255;
+        game.field_player2_attacked_this_turn = 255;
+        game.player1_verified_proof_this_turn = false;
+        game.player2_verified_proof_this_turn = false;
         game.turn_start_slot = Clock::get().unwrap().slot;
         emit!(TurnFinished {
             game: game.key(),
